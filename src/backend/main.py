@@ -1,13 +1,17 @@
 import logging
+from contextlib import asynccontextmanager
 from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+import database
 from governance.access_control import check_access
 from governance.audit import log_decision, setup_audit_logging
+from governance.identity import USER_ROLES
 from governance.purpose_control import check_purpose
+from routers.documents import router as documents_router
 from schemas import HealthResponse, HomeResponse, QueryRequest, QueryResponse
 
 logging.basicConfig(
@@ -16,6 +20,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("knowledge_platform")
 setup_audit_logging()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Runs once when the server starts: create the SQLite tables if needed."""
+    database.init_db()
+    logger.info("Database ready at %s", database.get_db_path())
+    yield
+
 
 # ---------------------------------------------------------------------------
 # Swagger / OpenAPI documentation text
@@ -38,6 +51,13 @@ Every query passes these checks **in order**. The first failure stops the reques
 
 Every decision is written to the audit log with its trace ID.
 
+## Document ingestion (`/documents`)
+
+Only the **admin** identity may upload, list, view or delete documents.
+Uploads accept PDF and TXT files (max 10 MB), extract the text, split it into
+chunks and store everything in SQLite. Scanned PDFs are rejected (no OCR).
+Errors use the shape `{status, error_code, reason, trace_id}`.
+
 ## Roles
 
 | Role | Purposes | Knowledge scopes |
@@ -57,6 +77,10 @@ TAGS_METADATA = [
     {
         "name": "Knowledge Query",
         "description": "Governed question endpoint with identity, purpose and scope checks.",
+    },
+    {
+        "name": "Documents",
+        "description": "Admin-only document upload, listing, inspection and deletion.",
     },
 ]
 
@@ -110,16 +134,12 @@ QUERY_200_EXAMPLES = {
 app = FastAPI(
     title="AI Knowledge Platform",
     description=API_DESCRIPTION,
-    version="1.1.0",
+    version="1.2.0",
     openapi_tags=TAGS_METADATA,
+    lifespan=lifespan,
 )
 
-# Temporary role assignment for development (replace with real auth later)
-USER_ROLES = {
-    "student001": "student",
-    "researcher001": "researcher",
-    "admin001": "admin",
-}
+app.include_router(documents_router)
 
 
 # ---------------------------------------------------------------------------
@@ -153,6 +173,35 @@ def refuse(
     )
 
 
+def error_content(
+    request: Request,
+    trace_id: UUID,
+    reason: str,
+    documents_status: str,
+    documents_code: str,
+) -> dict:
+    """
+    Build the JSON body for validation and server errors.
+
+    /documents errors use {status, error_code, reason, trace_id}.
+    Every other path keeps the original /query shape.
+    """
+    if request.url.path.startswith("/documents"):
+        return {
+            "status": documents_status,
+            "error_code": documents_code,
+            "reason": reason,
+            "trace_id": str(trace_id),
+        }
+    return {
+        "status": "refused",
+        "answer": None,
+        "citations": [],
+        "refusal_reason": reason,
+        "trace_id": str(trace_id),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Error handlers
 # ---------------------------------------------------------------------------
@@ -181,13 +230,7 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
 
     return JSONResponse(
         status_code=422,
-        content={
-            "status": "refused",
-            "answer": None,
-            "citations": [],
-            "refusal_reason": reason,
-            "trace_id": str(trace_id),
-        },
+        content=error_content(request, trace_id, reason, "rejected", "invalid_request"),
     )
 
 
@@ -206,13 +249,13 @@ async def unexpected_error_handler(request: Request, exc: Exception):
 
     return JSONResponse(
         status_code=500,
-        content={
-            "status": "refused",
-            "answer": None,
-            "citations": [],
-            "refusal_reason": "An internal error occurred. Please try again later.",
-            "trace_id": str(trace_id),
-        },
+        content=error_content(
+            request,
+            trace_id,
+            "An internal error occurred. Please try again later.",
+            "error",
+            "internal_error",
+        ),
     )
 
 

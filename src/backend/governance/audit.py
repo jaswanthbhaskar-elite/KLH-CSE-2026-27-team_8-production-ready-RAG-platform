@@ -1,14 +1,18 @@
 """
-Audit logging for authorization decisions.
+Audit logging for authorization decisions and document events.
 
 Every request that reaches the platform produces exactly one audit event,
 written as a single JSON line. JSON lines are easy to read, search with
 PowerShell, and load into SQLite later.
 
+Two kinds of event are written:
+- "request_decision": one per POST /query (see log_decision)
+- "document_event":   one per /documents request (see log_document_event)
+
 Rules this module follows:
 - Only the standard library is used (zero cost).
-- The question text and document contents are NEVER logged. Only the
-  question's length is recorded.
+- The question text and document contents are NEVER logged. Only lengths,
+  counts and identifiers are recorded.
 - User-controlled values are truncated and JSON-encoded, so a malicious
   user_id such as "x\\nFAKE LOG LINE" cannot forge extra log lines.
 
@@ -83,6 +87,11 @@ def _clean(value: Any, limit: int = MAX_VALUE_LENGTH) -> str | None:
     return text
 
 
+def _write(event: dict) -> None:
+    """Serialize one event as a single JSON line."""
+    audit_logger.info(json.dumps(event, ensure_ascii=True))
+
+
 def log_decision(
     *,
     trace_id: UUID,
@@ -97,7 +106,7 @@ def log_decision(
     question_length: int | None = None,
 ) -> None:
     """
-    Write one audit event.
+    Write one audit event for POST /query (or a validation/server error).
 
     decision: "allow", "deny", "invalid" (failed validation) or "error"
     stage:    where the decision was made: "validation", "identity",
@@ -105,18 +114,72 @@ def log_decision(
     """
     scope_items = [_clean(item) for item in (requested_scope or [])[:MAX_SCOPE_ITEMS]]
 
-    event = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "event": "request_decision",
-        "trace_id": str(trace_id),
-        "user_id": _clean(user_id),
-        "role": _clean(role),
-        "purpose": _clean(purpose),
-        "requested_scope": scope_items,
-        "decision": decision,
-        "stage": stage,
-        "reason": _clean(reason, MAX_REASON_LENGTH),
-        "response_status": response_status,
-        "question_length": question_length,
-    }
-    audit_logger.info(json.dumps(event, ensure_ascii=True))
+    _write(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "request_decision",
+            "trace_id": str(trace_id),
+            "user_id": _clean(user_id),
+            "role": _clean(role),
+            "purpose": _clean(purpose),
+            "requested_scope": scope_items,
+            "decision": decision,
+            "stage": stage,
+            "reason": _clean(reason, MAX_REASON_LENGTH),
+            "response_status": response_status,
+            "question_length": question_length,
+        }
+    )
+
+
+def log_document_event(
+    *,
+    trace_id: UUID,
+    action: str,
+    decision: str,
+    stage: str,
+    user_id: str | None = None,
+    role: str | None = None,
+    document_id: str | None = None,
+    filename: str | None = None,
+    file_type: str | None = None,
+    file_size_bytes: int | None = None,
+    knowledge_scope: str | None = None,
+    page_count: int | None = None,
+    chunk_count: int | None = None,
+    http_status: int | None = None,
+    reason: str | None = None,
+) -> None:
+    """
+    Write one audit event for a /documents request.
+
+    action:   "upload", "list", "view" or "delete"
+    decision: "allow" (succeeded), "deny" (not authorized),
+              "reject" (bad file or input) or "error" (server problem)
+    stage:    where it was decided: "identity", "role", "scope", "file",
+              "extraction", "lookup", "storage" or "complete"
+
+    Only metadata is logged. The filename passed in must already be the
+    sanitized one. Document text is never an argument of this function.
+    """
+    _write(
+        {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "event": "document_event",
+            "trace_id": str(trace_id),
+            "action": action,
+            "decision": decision,
+            "stage": stage,
+            "user_id": _clean(user_id),
+            "role": _clean(role),
+            "document_id": _clean(document_id),
+            "filename": _clean(filename),
+            "file_type": _clean(file_type),
+            "file_size_bytes": file_size_bytes,
+            "knowledge_scope": _clean(knowledge_scope),
+            "page_count": page_count,
+            "chunk_count": chunk_count,
+            "http_status": http_status,
+            "reason": _clean(reason, MAX_REASON_LENGTH),
+        }
+    )
